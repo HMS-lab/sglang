@@ -101,3 +101,62 @@ Pass LocalService options via `--hicache-storage-backend-extra-config` (JSON). K
 
 
 For more options, see [MemCache Configuration Guide — LocalService Config](https://gitcode.com/Ascend/memcache/blob/master/doc/memcache_config.md#localservice-config).
+
+## Optional parent-aware writes
+
+Parent metadata is disabled by default and it then doesn't change the way the programme
+is used at all (with respect to the previous version). To enable it, add both entries to the
+existing `--hicache-storage-backend-extra-config` JSON or configuration file:
+
+```json
+{
+  "hicache_storage_pass_prefix_keys": true,
+  "enable_parent_keys": true
+}
+```
+
+Keep the other connection and LocalService settings in the same configuration.
+`enable_parent_keys` is an SGLang adapter option, not a MemCache `LocalConfig`
+field. It must be a boolean. The client and MetaService must support
+`batch_put_from_with_parents`. Older clients remain supported when this option is
+disabled.
+
+From the point of view of the programme, the method does the same thing as the
+defult `_put_batch_zero_copy_impl`, but Memcache uses addtional provided information
+to preserve information about prefix of a batch and enable prefix-aware eviction.
+
+For parent-aware v1 and v2 writes, the adapter groups all pages into one path per
+component. It passes only the parent of the first node in each path, not a parent
+for every object. For example, with preceding page `A` and current pages `B, C`,
+MHA rank 0 sends:
+
+```text
+keys:         [B_0_k, C_0_k, B_0_v, C_0_v]
+parent_keys:  [A_0_k, A_0_v]
+buffer_ptrs:  [B_0_k_ptr, C_0_k_ptr, B_0_v_ptr, C_0_v_ptr]
+buffer_sizes: [B_0_k_size, C_0_k_size, B_0_v_size, C_0_v_size]
+```
+
+Keys are component-major: the complete `k` path comes before the complete `v`
+path. Each path keeps logical page order (`B` then `C`), and its entry in
+`parent_keys` identifies the corresponding component of `A`. Buffer pointers and
+sizes are reordered together with the keys.
+
+Tags and TP/PP/CP suffixes are preserved. At the sequence root, every path has the
+empty parent key `""`. Missing prefix context (`prefix_keys=None`) is an error in
+this mode, not an implicit sequence root. The same grouping applies to MLA
+components and the supported v2 pools (Indexer, Mamba and Draft), including
+tail-only transfers.
+
+Writes delegate directly to
+`batch_put_from_with_parents(keys, parent_keys, buffer_ptrs, buffer_sizes)`.
+The method must return a `List[int]` of length `len(keys)`, in the same
+component-major order as the request, not one status per path or a single batch
+status. Return `0` for success, including already existing or successfully
+skipped objects, and a nonzero code (normally negative) for an error.
+
+The adapter restores page-major status order before combining component statuses
+into page-level results: a page succeeds only if all its component statuses are
+`0`. For the example above, `[0, 0, -7, 0]` means page `B` failed because `B_0_v`
+failed, while page `C` succeeded. MemCache owns allocation, copying and write
+completion.
