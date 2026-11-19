@@ -47,6 +47,7 @@ _MEMCACHE_CTRL_KEYS = frozenset(
         "metrics_url",
         "memcache_metrics_url",
         "extra_backend_tag",
+        "enable_parent_keys",
     }
 )
 
@@ -176,6 +177,9 @@ class NpuMemcacheStore(HiCacheStorage):
 
         try:
             config = NpuMemcacheConfig.from_sources(storage_config)
+            self.enable_parent_keys = config.ctrl.get("enable_parent_keys", False)
+            if not isinstance(self.enable_parent_keys, bool):
+                raise ValueError("enable_parent_keys must be a bool")
             local_cfg = LocalConfig()
             unknown_fields = config.apply_to_local_config(local_cfg)
             if unknown_fields:
@@ -184,6 +188,14 @@ class NpuMemcacheStore(HiCacheStorage):
                 )
 
             self.store = DistributedObjectStore()
+            if self.enable_parent_keys:
+                if not callable(
+                    getattr(self.store, "batch_put_from_with_parents", None)
+                ):
+                    raise RuntimeError(
+                        "enable_parent_keys requires a MemCache client and MetaService "
+                        "supporting batch_put_from_with_parents"
+                    )
             if self.store.setup(local_cfg) != 0:
                 raise RuntimeError(
                     "memcache_hybrid.DistributedObjectStore.setup failed"
@@ -390,6 +402,65 @@ class NpuMemcacheStore(HiCacheStorage):
             return keys
         return [f"{self.extra_backend_tag}_{key}" for key in keys]
 
+    def _get_parent_component_keys(
+        self,
+        page_keys: List[str],
+        component_keys: List[str],
+        extra_info: Optional[HiCacheStorageExtraInfo],
+    ) -> Optional[List[str]]:
+        """Build parent keys for each component path in a prefix-aware MemCache write.
+
+        Each logical page has the same set of component suffixes (e.g., K/V and
+        TP/PP/CP identifiers). Extract these suffixes from the first page's
+        storage keys (in component_keys) and attach them to the last prefix hash, 
+        preserving the optional backend tag.
+
+        Example:
+            page_keys = ["A", "B", "C"]
+            prefix_keys = ["Y", "X"]
+            component_keys = ["tag_A_0_k", "tag_A_0_v",
+                            "tag_B_0_k", "tag_B_0_v",
+                            "tag_C_0_k", "tag_C_0_v"]
+
+            Returns: ["tag_X_0_k", "tag_X_0_v"]
+
+        MemCache uses these parent keys to extend the existing prefix paths
+        with the new pages.
+        Returns None if parent-aware writes are disabled.
+        """
+        if not self.enable_parent_keys:
+            return None
+        if extra_info is None or extra_info.prefix_keys is None:
+            raise ValueError(
+                "enable_parent_keys requires prefix_keys; set "
+                "hicache_storage_pass_prefix_keys to true in "
+                "--hicache-storage-backend-extra-config"
+            )
+        if not page_keys:
+            if component_keys:
+                raise ValueError("Component keys require at least one page key")
+            return []
+        if not component_keys or len(component_keys) % len(page_keys):
+            raise ValueError("Component keys must contain a complete group per page")
+
+        # Get a tagged first page to later use its length to know where the valid suffix starts.
+        first_page = self._tag_keys(page_keys[:1])[0]
+
+        # Use the last prefix page as the parent, preserving the backend tag.
+        prefix_keys = extra_info.prefix_keys
+        first_parent = self._tag_keys([prefix_keys[-1]])[0] if prefix_keys else ""
+
+        key_multiplier = len(component_keys) // len(page_keys)
+        parent_keys = []
+        for component_key in component_keys[:key_multiplier]:
+            if not component_key.startswith(f"{first_page}_"):
+                raise ValueError("Component key does not match its logical page")
+            # Cut the prefix (eg. tag_A_0_k becomes _0_k).
+            suffix = component_key[len(first_page) :]
+            # Add it to the tagged parent (eg. tag_X becomes tag_X_0_k).
+            parent_keys.append(f"{first_parent}{suffix}" if first_parent else "")
+        return parent_keys
+
     def _mla_uses_kv_split(self) -> bool:
         return (
             self.is_mla_backend
@@ -511,7 +582,12 @@ class NpuMemcacheStore(HiCacheStorage):
 
         return PoolTransferResult(final_pages, hit_count)
 
-    def _batch_io_v2(self, transfers: List[PoolTransfer], is_set: bool):
+    def _batch_io_v2(
+        self,
+        transfers: List[PoolTransfer],
+        is_set: bool,
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
+    ):
         # Unified v2 I/O path: each PoolTransfer can expand to one or more
         # storage objects per logical page, but API still reports page-level result.
         results: dict = {}
@@ -546,17 +622,27 @@ class NpuMemcacheStore(HiCacheStorage):
             key_strs = self._tag_keys(key_strs)
 
             if is_set:
-                exist_result = self._batch_exist(key_strs)
-                io_results = [0 if state == 1 else -1 for state in exist_result]
-                missing_idx = [i for i, state in enumerate(exist_result) if state != 1]
-                if missing_idx:
-                    put_results = self._put_batch_zero_copy_impl(
-                        [key_strs[i] for i in missing_idx],
-                        [ptr_list[i] for i in missing_idx],
-                        [element_size_list[i] for i in missing_idx],
+                parent_keys = self._get_parent_component_keys(
+                    keys, key_strs, extra_info
+                )
+                if parent_keys is not None:
+                    io_results = self._put_batch_with_parents(
+                        key_strs, parent_keys, ptr_list, element_size_list
                     )
-                    for i, res in zip(missing_idx, put_results):
-                        io_results[i] = res
+                else:
+                    exist_result = self._batch_exist(key_strs)
+                    io_results = [0 if state == 1 else -1 for state in exist_result]
+                    missing_idx = [
+                        i for i, state in enumerate(exist_result) if state != 1
+                    ]
+                    if missing_idx:
+                        put_results = self._put_batch_zero_copy_impl(
+                            [key_strs[i] for i in missing_idx],
+                            [ptr_list[i] for i in missing_idx],
+                            [element_size_list[i] for i in missing_idx],
+                        )
+                        for i, res in zip(missing_idx, put_results):
+                            io_results[i] = res
             else:
                 io_results = self._get_batch_zero_copy_impl(
                     key_strs, ptr_list, element_size_list
@@ -579,7 +665,7 @@ class NpuMemcacheStore(HiCacheStorage):
         transfers: List[PoolTransfer],
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> dict:
-        return self._batch_io_v2(transfers, is_set=True)
+        return self._batch_io_v2(transfers, is_set=True, extra_info=extra_info)
 
     def _get_mha_split_heads_buffer_meta(self, keys, indices):
         ptr_list, element_size_list = (
@@ -700,28 +786,41 @@ class NpuMemcacheStore(HiCacheStorage):
         key_strs, buffer_ptrs, buffer_sizes = self._batch_preprocess(
             page_keys, host_indices
         )
-        exist_result = self._batch_exist(key_strs)
-        existing_keys = sum(1 for state in exist_result if state == 1)
-
-        set_keys = []
-        set_buffer_ptrs = []
-        set_buffer_sizes = []
-        set_indices = []
+        parent_keys = self._get_parent_component_keys(keys, key_strs, extra_info)
         set_results = [-1] * len(key_strs)
-        for i in range(len(key_strs)):
-            if exist_result[i] != 1:
-                set_keys.append(key_strs[i])
-                set_buffer_ptrs.append(buffer_ptrs[i])
-                set_buffer_sizes.append(buffer_sizes[i])
-                set_indices.append(i)
-            else:
-                set_results[i] = 0
+        if parent_keys is not None:
+            set_keys = key_strs
+            set_buffer_ptrs = buffer_ptrs
+            set_buffer_sizes = buffer_sizes
+            set_indices = list(range(len(key_strs)))
+        else:
+            exist_result = self._batch_exist(key_strs)
+            set_keys = []
+            set_buffer_ptrs = []
+            set_buffer_sizes = []
+            set_indices = []
+            for i in range(len(key_strs)):
+                if exist_result[i] != 1:
+                    set_keys.append(key_strs[i])
+                    set_buffer_ptrs.append(buffer_ptrs[i])
+                    set_buffer_sizes.append(buffer_sizes[i])
+                    set_indices.append(i)
+                else:
+                    set_results[i] = 0
 
         if set_keys:
             start_time = time.perf_counter()
-            put_results = self._put_batch_zero_copy_impl(
-                set_keys, set_buffer_ptrs, set_buffer_sizes
-            )
+            if parent_keys is None:
+                put_results = self._put_batch_zero_copy_impl(
+                    set_keys, set_buffer_ptrs, set_buffer_sizes
+                )
+            else:
+                put_results = self._put_batch_with_parents(
+                    set_keys,
+                    parent_keys,
+                    set_buffer_ptrs,
+                    set_buffer_sizes,
+                )
             end_time = time.perf_counter()
 
             if self.enable_storage_metrics and end_time > start_time:
@@ -913,6 +1012,46 @@ class NpuMemcacheStore(HiCacheStorage):
         self, key_strs: List[str], buffer_ptrs: List[int], buffer_sizes: List[int]
     ) -> List[int]:
         return self.store.batch_put_from(key_strs, buffer_ptrs, buffer_sizes)
+
+    def _put_batch_with_parents(
+        self,
+        key_strs: List[str],
+        parent_keys: List[str],
+        buffer_ptrs: List[int],
+        buffer_sizes: List[int],
+    ) -> List[int]:
+        """Write component-major paths and restore page-major result ordering.
+
+        Input keys are page-major: [A_k, A_v, B_k, B_v].
+        MemCache expects component-major: [A_k, B_k, A_v, B_v],
+        with one parent key per component path: [X_k, X_v].
+
+        Buffer pointers and sizes are reordered in the same way.
+        MemCache results are then restored to page-major order.
+        """
+        if not key_strs:
+            return []
+        key_multiplier = len(parent_keys)
+        if not key_multiplier or len(key_strs) % key_multiplier:
+            raise ValueError("Component keys must contain a complete path per parent")
+        # Group page-major entries into consecutive component paths.
+        path_indices = [
+            i
+            for component in range(key_multiplier)
+            for i in range(component, len(key_strs), key_multiplier)
+        ]
+        put_results = self.store.batch_put_from_with_parents(
+            [key_strs[i] for i in path_indices],
+            parent_keys,
+            [buffer_ptrs[i] for i in path_indices],
+            [buffer_sizes[i] for i in path_indices],
+        )
+
+        # Results must be converted into page-major as they come component-major.
+        results = [-1] * len(key_strs)
+        for i, result in zip(path_indices, put_results):
+            results[i] = result
+        return results
 
     def _get_batch_zero_copy_impl(
         self, key_strs: List[str], buffer_ptrs: List[int], buffer_sizes: List[int]
